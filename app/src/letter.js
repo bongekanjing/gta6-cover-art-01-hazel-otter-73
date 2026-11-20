@@ -141,7 +141,14 @@ const OUTLINE = 0.082;
 
 /** The numeral's proportion of the title size, and the gap that separates it from the title. */
 const NUM_RATIO = 0.78;
-const NUM_GAP = 0.2;
+const NUM_GAP = 0.42;
+
+/**
+ * The hard offset shadow, in em. It is a full silhouette of every glyph, so the room it takes
+ * to the right of the last letter has to be reserved in the fit: otherwise the shadow of the
+ * last glyph lands on the numeral and closes a gap the layout thinks it has.
+ */
+const SHADOW = { x: 0.046, y: 0.052 };
 
 /**
  * The numeral's outline, sized so the numeral's ink grows *exactly* as much as the title's:
@@ -171,7 +178,10 @@ function fitLockup(ctx, lines, maxW, maxH, numeral) {
   };
   const solve = (set) => {
     const leading = set.length > 1 ? 0.88 : 1;
-    const budget = (size) => maxW - numGap * size - numWide(size);
+    // The hard ink shadow is stamped at +SHADOW.x em right, so the wordmark's visible right
+    // edge is that much past its measured ink. Budgeting for it here is what keeps the last
+    // letter off the numeral instead of under it.
+    const budget = (size) => maxW - numGap * size - numWide(size) - SHADOW.x * size;
     // Fit against the room left after the numeral, by bisecting on the width budget instead
     // of shrinking after the fact: one solve, no multiplicative drift.
     let lo = 6;
@@ -275,11 +285,15 @@ export function drawLockup(ctx, rect, grade, options) {
    * One glyph, at its ink-kerned pen position, turned by its own wobble and condensed. Every
    * layer calls this, so the ink shadow, the outline, the drop, the fill and the highlight are
    * the same letterform painted five times, and can never drift apart.
+   *
+   * The pen is multiplied by CONDENSE *before* the scale, so the glyphs stay on the positions
+   * layoutLine computed: condensing after the translate would widen every gap by 1/CONDENSE and
+   * destroy the even tracking the fit depends on.
    */
   const orbit = (ch, pen, gi, paint) => {
     const w = wobble(gi);
     ctx.save();
-    ctx.translate(pen, w.lift);
+    ctx.translate(pen * CONDENSE, w.lift);
     ctx.rotate(w.turn);
     ctx.scale(CONDENSE, 1);
     paint(ch);

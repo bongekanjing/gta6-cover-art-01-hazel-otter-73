@@ -5,18 +5,27 @@
 // away: the big shapes, the value breaks between them, and a coarse idea of hue.
 //
 //   photo -> heavy blur -> per-panel value normalise -> crush -> four flat tones
-//         -> mode filter (kills confetti) -> flat palette (tone x hue sector)
-//         -> ink contours stamped where tones meet, heavier where the tonal jump is bigger
+//         -> area despeckle (no region smaller than a brush-load survives)
+//         -> twelve flat fills (tone x hue sector)
+//         -> contour distance field -> antialiased, weight-varying ink lines
 //
 // There is no grain, no stipple, no halftone screen and no per-pixel tinting anywhere in this
 // file. Every colour inside a panel is one of twelve flat values taken from the grade's
-// four-tone ramp, and every boundary between two of them is a drawn line. That is the whole
+// four-tone ramp, and every boundary between two tones is a drawn line. That is the whole
 // trick: flat fills the eye can name, and contours the eye can follow.
+//
+// The contour is the interesting part. Thresholding a band map gives broken, stair-stepped,
+// speckle-ringed edges — the "photo with a filter" tell. So the boundaries are traced as
+// *distance fields* at cell resolution, bilinearly resampled to the panel, and thresholded
+// there. A line therefore comes out continuous (the field has no gaps), antialiased (the ramp
+// is sub-pixel) and of varying weight (a second field is kept for the strong boundaries, and
+// it is wider). Silhouettes get a fat contour, interior modelling a thin one — the way a
+// painted plate varies line weight without a brush engine.
 //
 // One light, one grade. Each panel's value range is normalised to the same percentile window
 // and then cut into the same four steps, so a dim shot and a bright one land on the same four
-// tones; the ramp itself carries the sunset (plum in the shade, amber in the light). Three
-// panels cut from three photographs therefore read as three views of one place at one hour.
+// tones; the ramp itself carries the sunset. Three panels cut from three photographs therefore
+// read as three views of one place at one hour.
 
 /**
  * The three grades the editor offers.
@@ -25,7 +34,7 @@
  *   ink    the contour colour: a near-black with the grade's hue in it, never pure black.
  *   light  the brightest accent, used by the lettering and the numeral.
  *   drop   the lettering's offset shadow.
- *   paper/wash/glow/hatch   the poster card the panels sit on.
+ *   paper/wash/glow   the poster card the panels sit on.
  *   sun    where the poster's low sun sits, in cover coordinates, for the backdrop glow.
  */
 export const GRADES = {
@@ -41,7 +50,6 @@ export const GRADES = {
     paper: '#110a1b',
     wash: '#3f1246',
     glow: '#ff9a4e',
-    hatch: '#ffcf8e',
     sun: { x: 0.5, y: 0.94, r: 0.62 },
   },
   neon: {
@@ -56,7 +64,6 @@ export const GRADES = {
     paper: '#080618',
     wash: '#2a1160',
     glow: '#ff4fa2',
-    hatch: '#9fe8ff',
     sun: { x: 0.5, y: 0.9, r: 0.58 },
   },
   heat: {
@@ -71,28 +78,31 @@ export const GRADES = {
     paper: '#120406',
     wash: '#54100c',
     glow: '#ff8a1f',
-    hatch: '#ffd08a',
     sun: { x: 0.5, y: 0.96, r: 0.66 },
   },
 };
 
 export const GRADE_ORDER = ['dusk', 'neon', 'heat'];
 
-/** The working grid's long side, in cells. Cel art wants big shapes, not pixels. */
-const WORK_LONG = 640;
+/** The working grid's long side, in cells. Cel art wants shapes, not pixels. */
+const WORK_LONG = 760;
 
 /** How far the value curve is pushed away from mid grey before banding. */
-const CRUSH = 1.24;
+const CRUSH = 1.22;
 
 /** The value window taken from each panel's own histogram (percentiles, not min/max). */
 const CUT_LO = 0.03;
 const CUT_HI = 0.97;
 
-/** How many times the 3x3 modal filter runs. Each pass erases specks one cell smaller. */
-const MODE_PASSES = 2;
+/** No region smaller than this share of the panel survives: it is confetti, not a shape. */
+const MIN_REGION = 0.00055;
 
 /** Above this chroma a cell is given a warm or cool variant instead of the neutral fill. */
-const HUE_FLOOR = 16;
+const HUE_FLOOR = 18;
+
+/** Contour half-widths in cells: the thin line, and the heavy silhouette line. */
+const W_THIN = 1.15;
+const W_HEAVY = 2.05;
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 
@@ -160,23 +170,21 @@ export function panFactor(source, W, H, zoom) {
 }
 
 /**
- * Two passes of a separable [1 2 1] blur over one float plane, in place.
+ * Separable [1 2 1] blur, run `passes` times over one float plane, in place.
  * This is the pass that decides what counts as a shape: run hard enough, stubble, weave, water
  * ripple and JPEG mosquito noise all collapse, while a jawline or a horizon survives.
  */
-function blurPlane(plane, w, h) {
+function blurPlane(plane, w, h, passes) {
   const tmp = new Float32Array(plane.length);
-  for (let pass = 0; pass < 2; pass++) {
+  for (let pass = 0; pass < passes; pass++) {
     for (let y = 0; y < h; y++) {
       const row = y * w;
-      const last = row + w - 1;
       for (let x = 0; x < w; x++) {
         const i = row + x;
         const l = x > 0 ? plane[i - 1] : plane[i];
         const r = x < w - 1 ? plane[i + 1] : plane[i];
         tmp[i] = (l + plane[i] + plane[i] + r) * 0.25;
       }
-      tmp[last] = tmp[last];
     }
     for (let y = 0; y < h; y++) {
       const row = y * w;
@@ -191,61 +199,143 @@ function blurPlane(plane, w, h) {
 }
 
 /**
- * The most common value in each cell's 3x3 neighbourhood, centre winning ties, in place.
- * A flat fill can only be flat if the labels under it are: a single speck of the wrong tone in
- * a stretch of sky paints a hole, and a hole in a flat is exactly the "photo with a filter on
- * it" tell this pass exists to remove.
+ * Absorb every region smaller than `minArea` cells into the label around it.
+ *
+ * This is the pass that ends the confetti. A photo has thousands of one-cell value islands —
+ * the top of a hair, a glint on chrome, a ripple — and a band map draws each one as a ring of
+ * ink, which is exactly what made the earlier version read as a filtered photograph. A cell
+ * that belongs to a region too small to be a shape is repainted as its most common neighbour,
+ * and the sweep is repeated, because absorbing one speck can orphan the next.
+ *
+ * `passes` bounds the work: four sweeps clear specks of up to four cells' growth, which is
+ * every artefact a 7-cell blur leaves behind.
  */
-function modeFilter(labels, w, h, passes) {
-  const src = new Uint8Array(labels.length);
-  for (let p = 0; p < passes; p++) {
-    src.set(labels);
-    for (let y = 1; y < h - 1; y++) {
-      let i = y * w + 1;
-      for (let x = 1; x < w - 1; x++, i++) {
-        const a0 = src[i - w - 1];
-        const a1 = src[i - w];
-        const a2 = src[i - w + 1];
-        const a3 = src[i - 1];
-        const a4 = src[i];
-        const a5 = src[i + 1];
-        const a6 = src[i + w - 1];
-        const a7 = src[i + w];
-        const a8 = src[i + w + 1];
-        let c0 = 0;
-        let c1 = 0;
-        let c2 = 0;
-        let c3 = 0;
-        c0 += a0 === 0; c1 += a0 === 1; c2 += a0 === 2; c3 += a0 === 3;
-        c0 += a1 === 0; c1 += a1 === 1; c2 += a1 === 2; c3 += a1 === 3;
-        c0 += a2 === 0; c1 += a2 === 1; c2 += a2 === 2; c3 += a2 === 3;
-        c0 += a3 === 0; c1 += a3 === 1; c2 += a3 === 2; c3 += a3 === 3;
-        c0 += a4 === 0; c1 += a4 === 1; c2 += a4 === 2; c3 += a4 === 3;
-        c0 += a5 === 0; c1 += a5 === 1; c2 += a5 === 2; c3 += a5 === 3;
-        c0 += a6 === 0; c1 += a6 === 1; c2 += a6 === 2; c3 += a6 === 3;
-        c0 += a7 === 0; c1 += a7 === 1; c2 += a7 === 2; c3 += a7 === 3;
-        c0 += a8 === 0; c1 += a8 === 1; c2 += a8 === 2; c3 += a8 === 3;
-        // The centre's own count is 2 in the comparison below, so it wins every tie.
-        const m0 = c0 * 2 + (a4 === 0);
-        const m1 = c1 * 2 + (a4 === 1);
-        const m2 = c2 * 2 + (a4 === 2);
-        const m3 = c3 * 2 + (a4 === 3);
-        let best = a4;
-        let top = m0;
-        if (m1 > top) { top = m1; best = 1; }
-        if (m2 > top) { top = m2; best = 2; }
-        if (m3 > top) { best = 3; }
-        labels[i] = best;
+function despeckle(labels, w, h, minArea, passes) {
+  const total = w * h;
+  const seen = new Uint8Array(total);
+  const stack = new Int32Array(total);
+  const members = new Int32Array(total);
+  const counts = new Int32Array(64);
+
+  for (let pass = 0; pass < passes; pass++) {
+    seen.fill(0);
+    let changed = false;
+    for (let start = 0; start < total; start++) {
+      if (seen[start]) continue;
+      const label = labels[start];
+      let top = 0;
+      let n = 0;
+      stack[top++] = start;
+      seen[start] = 1;
+      while (top > 0) {
+        const i = stack[--top];
+        members[n++] = i;
+        const x = i % w;
+        const y = (i / w) | 0;
+        if (x > 0 && !seen[i - 1] && labels[i - 1] === label) { seen[i - 1] = 1; stack[top++] = i - 1; }
+        if (x < w - 1 && !seen[i + 1] && labels[i + 1] === label) { seen[i + 1] = 1; stack[top++] = i + 1; }
+        if (y > 0 && !seen[i - w] && labels[i - w] === label) { seen[i - w] = 1; stack[top++] = i - w; }
+        if (y < h - 1 && !seen[i + w] && labels[i + w] === label) { seen[i + w] = 1; stack[top++] = i + w; }
       }
+      if (n >= minArea) continue;
+
+      // Too small to keep. Its surrounding labels decide what it becomes: a region this small
+      // is edge material, so most of its cells touch the label that will replace them.
+      counts.fill(0);
+      for (let k = 0; k < n; k++) {
+        const i = members[k];
+        const x = i % w;
+        const y = (i / w) | 0;
+        if (x > 0 && labels[i - 1] !== label) counts[labels[i - 1]]++;
+        if (x < w - 1 && labels[i + 1] !== label) counts[labels[i + 1]]++;
+        if (y > 0 && labels[i - w] !== label) counts[labels[i - w]]++;
+        if (y < h - 1 && labels[i + w] !== label) counts[labels[i + w]]++;
+      }
+      let best = label;
+      let bestCount = 0;
+      for (let v = 0; v < counts.length; v++) {
+        if (counts[v] > bestCount) { bestCount = counts[v]; best = v; }
+      }
+      if (best === label) continue;
+      for (let k = 0; k < n; k++) labels[members[k]] = best;
+      changed = true;
     }
+    if (!changed) break;
   }
 }
 
 /**
+ * A chamfer distance transform: for every cell, the distance in cells to the nearest set cell
+ * of `seed`, capped at `cap`. Two sweeps of a 3x3 mask, which is all a contour needs.
+ */
+function distanceField(seed, w, h, cap) {
+  const field = new Float32Array(w * h);
+  const far = cap + 1;
+  for (let i = 0; i < field.length; i++) field[i] = seed[i] ? 0 : far;
+  const D1 = 1;
+  const D2 = 1.41421356;
+  const relax = (i, j, d) => {
+    const v = field[j] + d;
+    if (v < field[i]) field[i] = v;
+  };
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      const i = row + x;
+      if (field[i] === 0) continue;
+      if (x > 0) relax(i, i - 1, D1);
+      if (y > 0) {
+        if (x > 0) relax(i, i - w - 1, D2);
+        relax(i, i - w, D1);
+        if (x < w - 1) relax(i, i - w + 1, D2);
+      }
+    }
+  }
+  for (let y = h - 1; y >= 0; y--) {
+    const row = y * w;
+    for (let x = w - 1; x >= 0; x--) {
+      const i = row + x;
+      if (field[i] === 0) continue;
+      if (x < w - 1) relax(i, i + 1, D1);
+      if (y < h - 1) {
+        if (x < w - 1) relax(i, i + w + 1, D2);
+        relax(i, i + w, D1);
+        if (x > 0) relax(i, i + w - 1, D2);
+      }
+    }
+  }
+  for (let i = 0; i < field.length; i++) if (field[i] > cap) field[i] = cap;
+  return field;
+}
+
+/** Bilinear sample of a cell-resolution float field at fractional cell coordinates. */
+function sampleField(field, w, h, fx, fy) {
+  const x = fx < 0 ? 0 : fx > w - 1.001 ? w - 1.001 : fx;
+  const y = fy < 0 ? 0 : fy > h - 1.001 ? h - 1.001 : fy;
+  const x0 = x | 0;
+  const y0 = y | 0;
+  const tx = x - x0;
+  const ty = y - y0;
+  const i = y0 * w + x0;
+  const a = field[i];
+  const b = field[i + 1];
+  const c = field[i + w];
+  const d = field[i + w + 1];
+  const top = a + (b - a) * tx;
+  const bot = c + (d - c) * tx;
+  return top + (bot - top) * ty;
+}
+
+/** A smooth 1 inside the contour, 0 outside it, with a one-pixel ramp for antialiasing. */
+function inkAt(dist, half) {
+  if (dist >= half + 0.5) return 0;
+  if (dist <= half - 0.5) return 1;
+  return half + 0.5 - dist;
+}
+
+/**
  * The illustration pass. `options` is
- *   { width, height, grade, zoom, fx, fy, world }
- * where `world` describes the cover the panel sits on ({coverW, coverH, x, y}); it is only used
- * to place the placeholder's glow, since the panel grade is cover-independent by design.
+ *   { width, height, grade, zoom, fx, fy }
  *
  * Returns a new canvas holding the painted plate. No source yields a painted placeholder, so an
  * empty panel is still composed rather than a grey hole.
@@ -254,20 +344,19 @@ export function processPhoto(source, options) {
   const W = Math.max(8, Math.round(options.width));
   const H = Math.max(8, Math.round(options.height));
   const grade = GRADES[options.grade] ?? GRADES.dusk;
-  const world = options.world ?? { coverW: W, coverH: H, x: 0, y: 0 };
   const canvas = document.createElement('canvas');
   canvas.width = W;
   canvas.height = H;
   const ctx = canvas.getContext('2d');
 
   if (!source) {
-    paintPlaceholder(ctx, W, H, grade, world);
+    paintPlaceholder(ctx, W, H, grade, options.world);
     return canvas;
   }
 
   // 1. Down to the working grid and blur it flat. Everything from here on happens in cells, so
   //    the cost of the pass does not grow with the export size.
-  const gs = Math.min(1, WORK_LONG / Math.max(W, H));
+  const gs = Math.max(1e-6, Math.min(1, WORK_LONG / Math.max(W, H)));
   const gw = Math.max(12, Math.round(W * gs));
   const gh = Math.max(12, Math.round(H * gs));
   const scratch = document.createElement('canvas');
@@ -287,9 +376,11 @@ export function processPhoto(source, options) {
     pg[i] = px[p + 1];
     pb[i] = px[p + 2];
   }
-  blurPlane(pr, gw, gh);
-  blurPlane(pg, gw, gh);
-  blurPlane(pb, gw, gh);
+  // Three passes: a 7-cell kernel, which at a 760-cell grid is a generous brush. It is what
+  // turns a face into planes instead of pores.
+  blurPlane(pr, gw, gh, 3);
+  blurPlane(pg, gw, gh, 3);
+  blurPlane(pb, gw, gh, 3);
 
   // 2. Value, normalised per panel to the same percentile window. This is the step that makes
   //    three photographs share one exposure, and therefore one light.
@@ -315,14 +406,13 @@ export function processPhoto(source, options) {
   // 3. Band, crush and flatten. CRUSH pushes the shoulders out so the middle of the range is
   //    thin and each panel settles on four readable tones instead of six hazy ones.
   const bands = grade.bands;
-  const band = new Uint8Array(cells);
+  const tone = new Uint8Array(cells);
   for (let i = 0; i < cells; i++) {
     let t = clamp((lum[i] - lo) / span, 0, 1);
     t = clamp((t - 0.5) * CRUSH + 0.5, 0, 1);
     const b = Math.floor(t * bands);
-    band[i] = b >= bands ? bands - 1 : b;
+    tone[i] = b >= bands ? bands - 1 : b;
   }
-  modeFilter(band, gw, gh, MODE_PASSES);
 
   // 4. Hue sector: warm, neutral or cool, from the blurred photograph. Coarse on purpose — it
   //    picks between three near-shades of the same ramped tone, not between colours.
@@ -342,90 +432,70 @@ export function processPhoto(source, options) {
     if (hue < 0) hue += 360;
     sector[i] = hue < 105 || hue >= 330 ? 1 : 2;
   }
-  modeFilter(sector, gw, gh, 1);
 
-  // One byte per cell naming its flat fill. Tone x 3 + sector, so the tone is recoverable as
-  // (index / 3) | 0 and a contour can be found from the tone alone.
+  // 5. One byte per cell naming its flat fill: tone x 3 + sector. Then despeckle the whole
+  //    label so neither a tone speck nor a stray hue patch can survive as a ring of ink.
   const pal = new Uint8Array(cells);
-  for (let i = 0; i < cells; i++) pal[i] = band[i] * 3 + sector[i];
+  for (let i = 0; i < cells; i++) pal[i] = tone[i] * 3 + sector[i];
+  despeckle(pal, gw, gh, Math.max(20, Math.round(cells * MIN_REGION)), 4);
 
-  // 5. Up to the panel's own resolution, nearest-neighbour. The flats stay hard-edged; the ink
-  //    pass below is what covers the cell steps at the boundaries.
-  const colMap = new Int32Array(W);
-  for (let x = 0; x < W; x++) colMap[x] = Math.min(gw - 1, ((x * gw) / W) | 0);
-  const rowMap = new Int32Array(H);
-  for (let y = 0; y < H; y++) rowMap[y] = Math.min(gh - 1, ((y * gh) / H) | 0);
-  const big = new Uint8Array(W * H);
-  for (let y = 0; y < H; y++) {
-    const srcRow = rowMap[y] * gw;
-    const row = y * W;
-    for (let x = 0; x < W; x++) big[row + x] = pal[srcRow + colMap[x]];
-  }
-
-  // 6. Contours. A cell boundary where the TONE steps is ink; the wider the step, the heavier
-  //    the line. Because the tone map has already been modal-filtered, these contours close:
-  //    they are the outlines of the shapes, not the ghost of the photograph's texture.
-  const mask = new Uint8Array(W * H);
-  for (let y = 0; y < H - 1; y++) {
-    const row = y * W;
-    for (let x = 0; x < W; x++) {
+  // 6. Contours, as distance fields. A boundary cell is one whose tone differs from the cell to
+  //    its right or below it. `thin` seeds every such boundary; `heavy` seeds only the ones
+  //    where the tone steps by two bands or more, i.e. where a shape meets its background.
+  const thinSeed = new Uint8Array(cells);
+  const heavySeed = new Uint8Array(cells);
+  for (let y = 0; y < gh - 1; y++) {
+    const row = y * gw;
+    for (let x = 0; x < gw; x++) {
       const i = row + x;
-      const here = (big[i] / 3) | 0;
-      const right = x < W - 1 ? (big[i + 1] / 3) | 0 : here;
-      const down = (big[i + W] / 3) | 0;
-      const dr = here - right;
-      const dd = here - down;
-      const step = Math.max(dr < 0 ? -dr : dr, dd < 0 ? -dd : dd);
-      if (step > 0) mask[i] = step > 1 ? 2 : 1;
-    }
-  }
-
-  // 7. Weight by stamping. A three-pixel square for a one-tone break, five for a two-tone one:
-  //    silhouettes get a fat contour and interior modelling gets a thin one, which is how a
-  //    painted plate varies its line weight without a brush engine.
-  const alpha = new Float32Array(W * H);
-  for (let y = 0; y < H; y++) {
-    const row = y * W;
-    for (let x = 0; x < W; x++) {
-      const v = mask[row + x];
-      if (v === 0) continue;
-      const rad = v > 1 ? 2 : 1;
-      const level = v > 1 ? 1 : 0.82;
-      const y0 = y - rad < 0 ? 0 : y - rad;
-      const y1 = y + rad > H - 1 ? H - 1 : y + rad;
-      const x0 = x - rad < 0 ? 0 : x - rad;
-      const x1 = x + rad > W - 1 ? W - 1 : x + rad;
-      for (let yy = y0; yy <= y1; yy++) {
-        const at = yy * W;
-        for (let xx = x0; xx <= x1; xx++) {
-          if (alpha[at + xx] < level) alpha[at + xx] = level;
+      const here = (pal[i] / 3) | 0;
+      if (x < gw - 1) {
+        const right = (pal[i + 1] / 3) | 0;
+        const step = here > right ? here - right : right - here;
+        if (step > 0) {
+          thinSeed[i] = 1;
+          if (step > 1) heavySeed[i] = 1;
         }
+      }
+      const down = (pal[i + gw] / 3) | 0;
+      const step = here > down ? here - down : down - here;
+      if (step > 0) {
+        thinSeed[i] = 1;
+        if (step > 1) heavySeed[i] = 1;
       }
     }
   }
+  const distThin = distanceField(thinSeed, gw, gh, W_HEAVY + 2);
+  const distHeavy = distanceField(heavySeed, gw, gh, W_HEAVY + 2);
 
-  // 8. Composite: flat fill, then ink. A single 3x3 box over the mask keeps the cell steps from
-  //    showing as staircases inside the line.
+  // 7. Composite: flat fill, sampled nearest so the flats stay hard, then ink from the two
+  //    distance fields resampled bilinearly so the lines stay smooth at any export size.
   const inkRGB = rgbOf(grade.ink);
   const palette = paletteOf(grade);
   const out = ctx.createImageData(W, H);
   const dst = out.data;
+  const stepX = gw / W;
+  const stepY = gh / H;
   for (let y = 0; y < H; y++) {
     const row = y * W;
-    const up = y > 0 ? row - W : row;
-    const dn = y < H - 1 ? row + W : row;
+    const cy = (y + 0.5) * stepY - 0.5;
     for (let x = 0; x < W; x++) {
       const i = row + x;
       const p = i << 2;
-      const at = big[i] * 3;
+      const cx = (x + 0.5) * stepX - 0.5;
+      const sx = clamp(Math.round(cx), 0, gw - 1);
+      const sy = clamp(Math.round(cy), 0, gh - 1);
+      const at = pal[sy * gw + sx] * 3;
       let r = palette[at];
       let g = palette[at + 1];
       let b = palette[at + 2];
-      const a0 = x > 0 ? i - 1 : i;
-      const a1 = x < W - 1 ? i + 1 : i;
-      const coat =
-        (alpha[i] * 2 + alpha[a0] + alpha[a1] + alpha[up + x] + alpha[dn + x]) * 0.16666667;
-      if (coat > 0.02) {
+
+      // Convert the contour half-widths from cells to the panel's pixels on this axis.
+      const scale = (stepX + stepY) * 0.5;
+      const aThin = inkAt(sampleField(distThin, gw, gh, cx, cy), W_THIN / scale);
+      const aHeavy = inkAt(sampleField(distHeavy, gw, gh, cx, cy), W_HEAVY / scale);
+      const coat = aHeavy > aThin ? aHeavy : aThin;
+      if (coat > 0.002) {
         const k = coat > 1 ? 1 : coat;
         r += (inkRGB[0] - r) * k;
         g += (inkRGB[1] - g) * k;
@@ -442,31 +512,32 @@ export function processPhoto(source, options) {
 }
 
 /**
- * A painted panel for a slot with no photograph: the same four tones, a low sun, and a scatter
- * of dune shapes with ink on them, so the poster still looks composed before the first upload.
+ * A painted panel for a slot with no photograph: the same four tones, a low sun, and a bank of
+ * dunes with ink on them, so the poster still looks composed before the first upload.
  */
 function paintPlaceholder(ctx, W, H, grade, world) {
-  const palette = paletteOf(grade);
-  const sunY = H * 0.72;
+  const unitSize = Math.min(W, H);
+  const sunY = H * 0.7;
+
   ctx.fillStyle = grade.cel[1];
   ctx.fillRect(0, 0, W, H);
 
-  // Sky: two flat bands, hard edge between them.
+  // Sky: one flat band, a hard horizon, a half-disc of sun.
   ctx.fillStyle = grade.cel[2];
-  ctx.fillRect(0, 0, W, H * 0.42);
+  ctx.fillRect(0, 0, W, H * 0.46);
   ctx.fillStyle = grade.cel[3];
   ctx.beginPath();
-  ctx.arc(W * 0.5, sunY, Math.min(W, H) * 0.26, Math.PI, 0);
+  ctx.arc(W * 0.5, sunY, unitSize * 0.27, Math.PI, 0);
+  ctx.closePath();
   ctx.fill();
-  ctx.fillRect(0, sunY - 1, W, H * 0.07);
 
-  // Ground: one soft dune, cut flat.
+  // Ground: two dunes, cut flat, the far one lighter.
   ctx.fillStyle = grade.cel[0];
   ctx.beginPath();
   ctx.moveTo(0, H);
-  ctx.lineTo(0, H * 0.78);
-  ctx.quadraticCurveTo(W * 0.34, H * 0.6, W * 0.66, H * 0.8);
-  ctx.quadraticCurveTo(W * 0.84, H * 0.9, W, H * 0.84);
+  ctx.lineTo(0, H * 0.8);
+  ctx.quadraticCurveTo(W * 0.34, H * 0.6, W * 0.68, H * 0.82);
+  ctx.quadraticCurveTo(W * 0.86, H * 0.92, W, H * 0.85);
   ctx.lineTo(W, H);
   ctx.closePath();
   ctx.fill();
@@ -475,24 +546,25 @@ function paintPlaceholder(ctx, W, H, grade, world) {
   ctx.strokeStyle = grade.ink;
   ctx.lineJoin = 'round';
   ctx.lineCap = 'round';
-  ctx.lineWidth = Math.max(2, Math.min(W, H) * 0.009);
+  ctx.lineWidth = Math.max(2, unitSize * 0.008);
   ctx.beginPath();
-  ctx.moveTo(0, H * 0.42);
-  ctx.lineTo(W, H * 0.42);
+  ctx.moveTo(0, H * 0.46);
+  ctx.lineTo(W, H * 0.46);
   ctx.stroke();
-  ctx.lineWidth = Math.max(2, Math.min(W, H) * 0.013);
+  ctx.lineWidth = Math.max(2.5, unitSize * 0.014);
   ctx.beginPath();
-  ctx.arc(W * 0.5, sunY, Math.min(W, H) * 0.26, Math.PI, 0);
+  ctx.arc(W * 0.5, sunY, unitSize * 0.27, Math.PI, 0);
   ctx.stroke();
   ctx.beginPath();
-  ctx.moveTo(0, H * 0.78);
-  ctx.quadraticCurveTo(W * 0.34, H * 0.6, W * 0.66, H * 0.8);
-  ctx.quadraticCurveTo(W * 0.84, H * 0.9, W, H * 0.84);
+  ctx.moveTo(0, H * 0.8);
+  ctx.quadraticCurveTo(W * 0.34, H * 0.6, W * 0.68, H * 0.82);
+  ctx.quadraticCurveTo(W * 0.86, H * 0.92, W, H * 0.85);
   ctx.stroke();
 
-  // A pale disc for the sun itself, so the plate has a light source.
+  // The sun's disc, in the grade's brightest fill, so the plate has a light source.
   ctx.fillStyle = grade.light;
   ctx.beginPath();
-  ctx.arc(W * 0.5, sunY - Math.min(W, H) * 0.05, Math.min(W, H) * 0.12, 0, Math.PI * 2);
+  ctx.arc(W * 0.5, sunY - unitSize * 0.045, unitSize * 0.115, 0, Math.PI * 2);
   ctx.fill();
+  void world;
 }
