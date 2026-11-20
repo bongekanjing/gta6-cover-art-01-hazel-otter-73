@@ -24,29 +24,35 @@ export const SAMPLES = {
 };
 
 /**
- * Per photo, three framings in ascending scale. `fx`/`fy` are the point held in the middle of the
- * panel; `bias` scales the layout's own framing for that slot, so a slot asked for a wide view
- * stays wide and a slot asked for a face pushes in further.
+ * Per photo, the three framings as a focal point plus a small zoom bias.
  *
- *   wide  -- the whole place: horizon, water, the figure small in the frame.
+ * The bias numbers are small on purpose, and that is the correction that matters. The slots are
+ * not all the same shape: the hero is 1.87:1 and the strips are 2.55:1, so a strip is already
+ * showing only 30% of the frame's height once cover-fit has been applied. Asking a strip for a
+ * zoom of 2 on top of that crops into a horizontal band across the sunglasses and nothing else —
+ * which is what made the right-hand panels unreadable. Cover-fit has done most of the work
+ * already, so the bias only nudges it: a wide view stays wide, the face is a touch tighter, a
+ * detail a touch tighter again.
+ *
+ *   wide  -- the whole place: sky, water, the figure small in the frame.
  *   face  -- head and shoulders, the eyes on the upper third.
  *   part  -- a detail: hands, reel, chrome, cloth. No face at all.
  */
 const SHOTS = {
   pier: [
-    { fx: 0.5, fy: 0.42, bias: 1.0 },
-    { fx: 0.46, fy: 0.26, bias: 1.06 },
-    { fx: 0.62, fy: 0.66, bias: 1.02 },
+    { fx: 0.50, fy: 0.46, bias: 1.00 },
+    { fx: 0.34, fy: 0.27, bias: 1.06 },
+    { fx: 0.74, fy: 0.60, bias: 1.10 },
   ],
   boulevard: [
-    { fx: 0.5, fy: 0.44, bias: 1.0 },
-    { fx: 0.58, fy: 0.19, bias: 1.04 },
-    { fx: 0.3, fy: 0.66, bias: 1.0 },
+    { fx: 0.50, fy: 0.46, bias: 1.00 },
+    { fx: 0.52, fy: 0.20, bias: 1.04 },
+    { fx: 0.24, fy: 0.70, bias: 1.08 },
   ],
 };
 
 /** Which of a photo's three shots a panel of the given rank should take. */
-const RANK_SHOT = [0, 1, 2, 1, 2];
+const RANK_SHOT = [0, 1, 2];
 
 /**
  * The crop a photo wants in the n-th panel it lands in.

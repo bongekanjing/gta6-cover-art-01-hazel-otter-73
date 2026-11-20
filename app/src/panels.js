@@ -22,8 +22,9 @@ export const LAYOUTS = {
     hero: 0,
     title: { x: 0.03, y: 0.595, w: 0.94, h: 0.362 },
     over: false,
-    // [wide establishing shot, tight face, close detail]: three scales, not three crops.
-    framing: [1.0, 2.05, 1.85],
+    // Three scales, not three crops. Kept near 1 because cover-fit already frames a 2.55:1 strip
+    // hard; see the note in shots.js.
+    framing: [1.0, 1.02, 1.06],
   },
   triptych: {
     label: 'Triptych',
