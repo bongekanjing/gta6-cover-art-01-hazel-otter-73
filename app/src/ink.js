@@ -186,6 +186,32 @@ const LIGHT = { x: -0.42, y: -0.91, reach: 3, slope: 1.15, gain: 0.15 };
 const TERMINATOR = { hi: 0.34, lo: -0.3, min: 0.004 };
 
 /**
+ * Figure and ground.
+ *
+ * A riso poster reads as a scene rather than a pattern because the plate behind the subject is
+ * held one value step down, so the subject's silhouette has something to cut against. This is that
+ * separation, applied before the ink so the drawn line keeps the depth the contour pass gave it:
+ *
+ *   darken    ground is multiplied down by this — one step, not a wash, so the four flat plates
+ *             stay exactly where the banding put them.
+ *   desat     and pulled this far toward its own luminance, so the figure keeps the panel's colour
+ *             and the backdrop loses it.
+ *   tol       how much the value field may change between neighbouring cells and still count as
+ *             one surface. Set below a band step: a sky's gradient is inside it, a silhouette is
+ *             not, which is what gives the flood an edge to stop at.
+ *   island    islands smaller than this share of the panel are shading, not subjects, and stay
+ *             ground so no rim is drawn round a speck.
+ *   minFigure a panel whose separated figure is smaller than this has no subject to light, and is
+ *             left exactly as painted.
+ *   rim/alpha how wide the light rim on the ground side of a silhouette is, in display pixels, and
+ *             how strongly it is mixed toward the grade's light.
+ */
+const GROUND = {
+  darken: 0.82, desat: 0.3, area: 0.02, border: 0.1, minFigure: 0.03, maxFigure: 0.93,
+  rim: 3.2, rimAlpha: 0.55,
+};
+
+/**
  * Ink strength. The contour colour itself is near-black on its own; this is how much of it is
  * mixed in at the centre of a line, so the darkest tone of the plate and the ink on top of it stay
  * distinguishable. An ink that is merely the fourth darkest colour does not read as a drawn line —
@@ -535,6 +561,82 @@ function chamfer(mask, w, h) {
 }
 
 /**
+ * Which cells of a painted plate are ground, and how far each ground cell is from a figure.
+ *
+ * Cel painting destroys the one signal region-finding normally leans on: inside a figure the fills
+ * are perfectly flat, so any test that asks "is this cell textured?" walks straight through a
+ * subject and darkens its middle. The signal that survives the banding is the *step* — the plate
+ * draws a contour wherever tone changes by a band, and a silhouette is precisely the biggest step
+ * in the picture.
+ *
+ * So the mask is a tolerance flood of the continuous value field, seeded from every cell on the
+ * frame's edge. It walks anywhere the value changes gradually — a sky's gradient, a lit wall, a
+ * stretch of water — and stops dead at a silhouette, because crossing one means changing by more
+ * than the tolerance. Whatever the flood reaches is ground; whatever it is walled out of is
+ * figure. No thresholds on area or texture are involved in the decision, so nothing can leak
+ * through a flat cheek.
+ *
+ * `distFigure` is the chamfer transform of the figure mask, so a rim drawn from it is the same
+ * width along a whole silhouette, and islands too small to be a subject are handed back to the
+ * ground so the rim never scribbles round a shading speck.
+ */
+function figureAndGround(toneAt, sectorAt, w, h) {
+  const total = w * h;
+  const plateAt = new Int32Array(total);
+  for (let i = 0; i < total; i++) plateAt[i] = toneAt[i] * 3 + sectorAt[i];
+  const ground = new Uint8Array(total);
+  const stack = new Int32Array(total);
+  const seen = new Int32Array(total).fill(-1);
+  const members = new Int32Array(total);
+  const comps = [];
+
+  // Group the plate into its connected patches. Reached from every cell once, so this is linear.
+  for (let start = 0; start < total; start++) {
+    if (seen[start] >= 0) continue;
+    const id = comps.length;
+    const value = plateAt[start];
+    let n = 0;
+    let sp = 0;
+    let edge = 0;
+    stack[sp++] = start;
+    seen[start] = id;
+    while (sp > 0) {
+      const i = stack[--sp];
+      members[n++] = i;
+      const x = i % w;
+      if (x === 0 || x === w - 1 || i < w || i >= total - w) edge++;
+      const push = (j) => { if (seen[j] < 0 && plateAt[j] === value) { seen[j] = id; stack[sp++] = j; } };
+      if (x > 0) push(i - 1);
+      if (x < w - 1) push(i + 1);
+      if (i >= w) push(i - w);
+      if (i < total - w) push(i + w);
+    }
+    comps.push({ area: n, edge });
+  }
+
+  // Ground is the plate that owns the frame's margin: a patch that runs out to the edge of the
+  // panel and is big enough to be scenery rather than a highlight. Everything it does not cover is
+  // figure. Judged at patch scale, not cell scale, so a flat cheek cannot be mistaken for sky.
+  const perimeter = 2 * (w + h);
+  const isGround = comps.map((c) => c.edge / perimeter >= GROUND.border
+    && c.area >= total * GROUND.area);
+
+  const figure = new Uint8Array(total);
+  let figureCells = 0;
+  for (let i = 0; i < total; i++) {
+    if (isGround[seen[i]]) ground[i] = 1;
+    else {
+      figure[i] = 1;
+      figureCells++;
+    }
+  }
+
+  const share = figureCells / total;
+  if (share < GROUND.minFigure || share > GROUND.maxFigure) return null;
+
+  return { ground, figure, distFigure: chamfer(figure, w, h) };
+}
+/**
  * The illustration pass. `options` is
  *   { width, height, grade, zoom, fx, fy }
  *
@@ -759,6 +861,10 @@ export function processPhoto(source, options) {
 
   const toneAt = new Uint8Array(paintCells);
   const sectorAt = new Uint8Array(paintCells);
+  // The value field the bands were voted from, sampled again at the paint grid. Region growing
+  // needs a continuous surface to walk on — a banded map has no gradient, only steps — so this is
+  // the plane the figure/ground mask is built from.
+  const lumAt = new Float32Array(paintCells);
   for (let y = 0; y < PH; y++) {
     const row = y * PW;
     const fy = (y + 0.5) * stepY - 0.5;
@@ -779,6 +885,7 @@ export function processPhoto(source, options) {
       const i = row + x;
       toneAt[i] = bestB;
       sectorAt[i] = bestS;
+      lumAt[i] = bilinear(lum, gw, gh, fx, fy);
     }
   }
 
@@ -820,14 +927,26 @@ export function processPhoto(source, options) {
   const distForm = chamfer(edgeForm, PW, PH);
   const distSil = chamfer(edgeSil, PW, PH);
 
-  // 9. Fill and ink. Widths are given in display pixels and converted to the paint grid, so a small
-  //    panel's line has the same apparent weight as the hero's.
+  // 8b. Figure and ground, before a single pixel is written.
+  //
+  //     The ground is pushed one value step down and a little toward grey; a lit rim is then laid
+  //     on the ground side of every silhouette, so the subject cuts against what is behind it.
+  //     Both are mixes on the fill colour, never on the ink, so the drawn line keeps its depth and
+  //     the four plates stay exactly where the banding put them.
+  //
+  //     Widths are converted to the paint grid first, so the rim has the same apparent weight on a
+  //     small panel as on the hero.
   const inkRGB = rgbOf(grade.ink);
   const palette = paletteOf(grade);
   const toPaint = PW / W;
   const thinPx = Math.max(0.7, LINE_THIN * toPaint);
   const midPx = Math.max(thinPx + 0.5, LINE_MID * toPaint);
   const heavyPx = Math.max(midPx + 0.6, LINE_HEAVY * toPaint);
+  const fig = figureAndGround(toneAt, sectorAt, PW, PH);
+  const lightRGB = rgbOf(grade.light);
+  const rimPx = Math.max(1, GROUND.rim * toPaint);
+
+  // 9. Fill and ink.
 
   const plate = document.createElement('canvas');
   plate.width = PW;
@@ -840,6 +959,16 @@ export function processPhoto(source, options) {
     let r = palette[at];
     let g = palette[at + 1];
     let bl = palette[at + 2];
+
+    // Figure and ground: the backdrop sits one step back in value and loses some chroma, so the
+    // subject separates from it by value and not only by hue.
+    if (fig && fig.ground[i]) {
+      const lumv = r * 0.2126 + g * 0.7152 + bl * 0.0722;
+      const keep = 1 - GROUND.desat;
+      r = (lumv + (r - lumv) * keep) * GROUND.darken;
+      g = (lumv + (g - lumv) * keep) * GROUND.darken;
+      bl = (lumv + (bl - lumv) * keep) * GROUND.darken;
+    }
 
     // Ink coverage: each rank contributes a ribbon of constant width, and the greatest coverage
     // wins, so a silhouette's fat line is never thinned by the fold pass that also runs along it.
@@ -862,6 +991,21 @@ export function processPhoto(source, options) {
       const v = heavyPx - d;
       const kv = v > 1 ? 1 : v;
       if (kv > k) k = kv;
+    }
+
+    // The rim goes on the ground side of the silhouette only, and never over ink. A lit fringe on
+    // the figure itself reads as a filter; a lit fringe on the ground behind it reads as a light
+    // behind the subject, which is what the poster's sun is. Sides are mixed toward the grade's
+    // own light so the rim belongs to the ink set rather than to a colour picked for it.
+    if (fig && fig.ground[i] && k === 0) {
+      d = fig.distFigure[i];
+      if (d < rimPx) {
+        const t = 1 - d / rimPx;
+        const a = t * t * GROUND.rimAlpha;
+        r += (lightRGB[0] - r) * a;
+        g += (lightRGB[1] - g) * a;
+        bl += (lightRGB[2] - bl) * a;
+      }
     }
 
     if (k > 0) {

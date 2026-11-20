@@ -144,8 +144,17 @@ export function createState() {
 
     setLayout(name) {
       if (!LAYOUTS[name] || data.layout === name) return;
+      const was = panelCount();
       data.layout = name;
-      data.selected = Math.min(data.selected, LAYOUTS[name].panels.length - 1);
+      const now = LAYOUTS[name].panels.length;
+      // Slots the new layout adds have never been framed. Give each the photo the ones before it
+      // ended on, at the middle of that photo, so a switch to Grid 5 shows five pictures rather
+      // than two framed and three arbitrary leftovers.
+      for (let i = was; i < now; i++) {
+        const last = data.crops[Math.max(0, was - 1)] ?? blankCrop(0);
+        data.crops[i] = blankCrop(data.photos.length ? last.photo % data.photos.length : 0);
+      }
+      data.selected = Math.min(data.selected, now - 1);
       notify();
     },
 

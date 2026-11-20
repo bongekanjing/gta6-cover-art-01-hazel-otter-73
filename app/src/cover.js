@@ -110,3 +110,89 @@ export function renderToCanvas(state, W, H) {
   renderCover(canvas.getContext('2d'), W, H, state, { preview: false });
   return canvas;
 }
+
+/**
+ * The `?shot=variants` contact strip: four covers side by side in a 2 x 2 grid.
+ *
+ * Each cell goes through the same renderCover the Export button calls, at the variant's own
+ * aspect and grade, so the strip is the app's own drawing rather than a paste-up of four
+ * separate images: nothing is composited afterwards. The cell labels are drawn here, in the
+ * app, for the same reason the poster's chrome is — they are part of what the app renders.
+ */
+export function renderVariantsToCanvas(state, W, H, variants) {
+  const canvas = document.createElement('canvas');
+  canvas.width = W;
+  canvas.height = H;
+  const ctx = canvas.getContext('2d');
+
+  ctx.fillStyle = '#0a0611';
+  ctx.fillRect(0, 0, W, H);
+
+  const pad = Math.round(Math.min(W, H) * 0.028);
+  const gutter = Math.round(Math.min(W, H) * 0.022);
+  const labelH = Math.round(Math.min(W, H) * 0.05);
+  const cellW = Math.floor((W - pad * 2 - gutter) / 2);
+  const cellH = Math.floor((H - pad * 2 - gutter - labelH * 2) / 2);
+
+  variants.forEach((variant, i) => {
+    const col = i % 2;
+    const row = (i / 2) | 0;
+    const cx = pad + col * (cellW + gutter);
+    const cy = pad + row * (cellH + labelH + gutter);
+    const { w, h } = variant.size;
+    const scale = Math.min(cellW / w, cellH / h);
+    const dw = Math.round(w * scale);
+    const dh = Math.round(h * scale);
+    const dx = cx + Math.round((cellW - dw) / 2);
+    const dy = cy + Math.round((cellH - dh) / 2);
+
+    // The cell's own copy of the state: the cover changes, the photographs and the words do not.
+    const cell = { ...state, layout: variant.layout, grade: variant.grade };
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(dx, dy, dw, dh);
+    ctx.clip();
+    ctx.translate(dx, dy);
+    ctx.scale(dw / w, dh / h);
+    renderCover(ctx, w, h, cell, { preview: false });
+    ctx.restore();
+
+    // A keyline round the cell and its name beneath it, in the strip's own small type.
+    ctx.strokeStyle = 'rgba(255,232,196,0.26)';
+    ctx.lineWidth = Math.max(1, Math.round(W * 0.0012));
+    ctx.strokeRect(dx + 0.5, dy + 0.5, dw - 1, dh - 1);
+    ctx.fillStyle = 'rgba(255,238,212,0.68)';
+    ctx.font = `600 ${Math.round(labelH * 0.62)}px 'DejaVu Sans Mono', 'Liberation Mono', monospace`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(variant.label, dx + 2, dy + dh + labelH * 0.58);
+  });
+
+  return canvas;
+}
+
+/**
+ * The `?shot=detail` close-up: one window of the cover, magnified `zoom` times, at the cover's
+ * own pixel size.
+ *
+ * The cover is painted at `zoom` times its export resolution and the window's pixels are copied
+ * out of that one for one, so nothing is interpolated: the magnified ink line, hard terminator
+ * and lettering edges in the result are the render's own pixels. Painting at export size and
+ * scaling up instead would blur exactly the edge weights a detail shot exists to show.
+ */
+export function renderDetailToCanvas(state, W, H, zoom, cx, cy) {
+  const z = Math.max(1, Math.min(4, Math.round(zoom) || 1));
+  const big = renderToCanvas(state, W * z, H * z);
+  const cw = Math.round(W / z);
+  const ch = Math.round(H / z);
+  const sx = Math.round(Math.min(W - cw, Math.max(0, (cx ?? 0.5) * W - cw / 2)));
+  const sy = Math.round(Math.min(H - ch, Math.max(0, (cy ?? 0.5) * H - ch / 2)));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = W;
+  canvas.height = H;
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(big, sx * z, sy * z, cw * z, ch * z, 0, 0, W, H);
+  return canvas;
+}

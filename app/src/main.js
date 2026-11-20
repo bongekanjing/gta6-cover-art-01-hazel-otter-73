@@ -4,11 +4,11 @@
 // back as one render, so nothing can drift. Photographs are read with the File API on this machine
 // and never leave it. The preview calls the export's own render function at screen scale.
 
-import { createState, SIZES } from './state.js';
+import { createState, SIZES, sizeIndexOf } from './state.js';
 import { LAYOUTS, LAYOUT_ORDER } from './panels.js';
 import { GRADES, GRADE_ORDER, panFactor } from './ink.js';
-import { renderCover, renderToCanvas, invalidateArt } from './cover.js';
-import { loadImage, loadSamples, seedPanels, runShot } from './shots.js';
+import { renderCover, renderToCanvas, renderVariantsToCanvas, renderDetailToCanvas, invalidateArt } from './cover.js';
+import { loadImage, loadSamples, seedPanels, runShot, parseSize, VARIANTS } from './shots.js';
 
 const state = createState();
 const params = new URLSearchParams(location.search);
@@ -457,6 +457,23 @@ function ready() {
   });
 }
 
+/** Paste one finished canvas full-viewport into the shot stage. */
+function showStage(canvas) {
+  const stage = $('#poster-stage');
+  stage.textContent = '';
+  stage.append(canvas);
+}
+
+/** A `zoom`/`cx`/`cy` query triple, for the detail shot. */
+function windowFromParams(defaults) {
+  const raw = Number(params.get('zoom'));
+  return {
+    zoom: Number.isFinite(raw) && raw >= 1 ? Math.min(4, Math.round(raw)) : defaults.zoom,
+    cx: params.has('cx') ? Number(params.get('cx')) : defaults.cx,
+    cy: params.has('cy') ? Number(params.get('cy')) : defaults.cy,
+  };
+}
+
 async function boot() {
   buildControls();
   state.subscribe(() => scheduleRender());
@@ -465,15 +482,40 @@ async function boot() {
     document.body.classList.add('poster-only');
     const size = await runShot(state, params);
     const cover = size ?? { w: SIZES[state.get().sizeIndex].w, h: SIZES[state.get().sizeIndex].h };
-    const canvas = renderToCanvas(state.get(), cover.w, cover.h);
-    const stage = $('#poster-stage');
-    stage.append(canvas);
+    showStage(renderToCanvas(state.get(), cover.w, cover.h));
     document.title = `cover-${cover.w}x${cover.h}.png`;
     await ready();
     return;
   }
 
+  // The variants strip: four cells, each a real renderCover at its own layout, grade and size.
+  if (shotMode === 'variants') {
+    document.body.classList.add('poster-only');
+    await runShot(state, params);
+    const size = parseSize(params.get('strip')) ?? { w: 1440, h: 1030 };
+    showStage(renderVariantsToCanvas(state.get(), size.w, size.h, VARIANTS));
+    document.title = 'cover-variants.png';
+    await ready();
+    return;
+  }
+
+  // A 2x close-up of one window of the cover, for the ink and lettering detail.
+  if (shotMode === 'detail') {
+    document.body.classList.add('poster-only');
+    const size = await runShot(state, params);
+    const cover = size ?? { w: 1920, h: 1080 };
+    const win = windowFromParams({ zoom: 2, cx: 0.34, cy: 0.55 });
+    showStage(renderDetailToCanvas(state.get(), cover.w, cover.h, win.zoom, win.cx, win.cy));
+    document.title = 'cover-detail.png';
+    await ready();
+    return;
+  }
+
   if (shotMode === 'editor') {
+    // The size a shot asks for wins over the default, so an editor screenshot can show the
+    // 1080 x 1350 button live rather than only the square one.
+    const asked = parseSize(params.get('size'));
+    if (asked) state.setSize(sizeIndexOf(asked.w, asked.h));
     await runShot(state, params);
     renderThumbs();
     sizePreview();

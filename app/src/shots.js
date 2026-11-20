@@ -5,10 +5,16 @@
 //
 //   ?shot=editor&photo=pier,boulevard&caption=Pier%20Pressure&layout=classic&grade=dusk&size=1920x1080
 //   ?shot=poster&size=1920x1080&layout=classic&grade=dusk&photo=pier,boulevard&caption=Pier%20Pressure
+//   ?shot=variants&caption=Pier%20Pressure&photo=pier,boulevard
+//   ?shot=detail&size=1920x1080&zoom=2&cx=0.25&cy=0.66&layout=classic&grade=dusk
 //
 // `shot=poster` draws the cover full-viewport at its exact export size, so a Chrome --window-size
 // equal to that size is a screenshot of the exported PNG. window.__shotReady flips true after two
 // animation frames, once the fonts are in and the ink pass has run.
+//
+// `shot=variants` draws a four-cell contact strip of the same caption at four layout/grade pairs,
+// and `shot=detail` draws one region of the cover at `zoom` times the export's own resolution, so
+// both are the app's own drawing and every screenshot stays a plain downscale of a render.
 //
 // The framing table below is the answer to "three panels that look like one photo cropped three
 // ways". Each sample photo carries a shot list: a wide establishing view, a medium figure, a
@@ -50,6 +56,48 @@ const SHOTS = {
     { fx: 0.24, fy: 0.70, bias: 1.08 },
   ],
 };
+
+/**
+ * A `WxH` query value as a size, or null when it is absent or not two positive numbers.
+ * Both the poster shot and the editor shot read the size this way, so `?size=` means the same
+ * thing in either one.
+ */
+export function parseSize(raw) {
+  if (!raw) return null;
+  const parts = String(raw).toLowerCase().split('x');
+  if (parts.length !== 2) return null;
+  const w = Math.round(Number(parts[0]));
+  const h = Math.round(Number(parts[1]));
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return null;
+  return { w, h };
+}
+
+/**
+ * The four cells of the `variants` strip: a layout, a grade and a size each, chosen to show the
+ * range the editor has. The strip is the one screenshot that answers "does this app do more than
+ * one poster?" without needing four separate renders, and because each cell is painted by
+ * renderCover at that size, it is the app's own drawing rather than a montage.
+ */
+export const VARIANTS = [
+  { layout: 'classic', grade: 'dusk', size: { w: 1920, h: 1080 }, label: 'Classic · Dusk' },
+  { layout: 'grid5', grade: 'heat', size: { w: 1080, h: 1080 }, label: 'Grid 5 · Heat' },
+  { layout: 'triptych', grade: 'neon', size: { w: 1080, h: 1350 }, label: 'Triptych · Neon' },
+  { layout: 'single', grade: 'neon', size: { w: 1080, h: 1350 }, label: 'Single · Neon' },
+];
+
+/**
+ * A region of a cover, at `zoom` times native, as { sx, sy, sw, sh } in source pixels.
+ * Clamped so the window never leaves the source: a detail shot that ran off the edge would
+ * show the card's margin and read as a crop bug rather than as a close look at the ink.
+ */
+export function detailWindow(W, H, zoom, cx, cy) {
+  const z = Math.max(1, Math.min(6, Number(zoom) || 1));
+  const sw = Math.max(16, Math.round(W / z));
+  const sh = Math.max(16, Math.round(H / z));
+  const sx = Math.round(Math.min(W - sw, Math.max(0, (cx ?? 0.5) * W - sw / 2)));
+  const sy = Math.round(Math.min(H - sh, Math.max(0, (cy ?? 0.5) * H - sh / 2)));
+  return { sx, sy, sw, sh };
+}
 
 /** Which of a photo's three shots a panel of the given rank should take. */
 const RANK_SHOT = [0, 1, 2];
@@ -135,14 +183,8 @@ export async function runShot(state, params) {
 
   if (photos.length > 0) seedPanels(state, photos);
 
-  let size = null;
-  const raw = params.get('size');
-  if (raw) {
-    const [w, h] = raw.split('x').map(Number);
-    if (w > 0 && h > 0) size = { w, h };
-  }
   const panel = params.get('panel');
   if (panel !== null) state.select(Math.max(0, Number(panel) || 0));
 
-  return size;
+  return parseSize(params.get('size'));
 }
