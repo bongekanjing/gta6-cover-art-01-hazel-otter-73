@@ -1,23 +1,110 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cover Snap</title>
-<link rel="stylesheet" href="./style.css">
+<title>Vice Ledger — cover maker</title>
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
-<main class="app">
-  <section class="controls">
-    <h1>Cover Snap</h1>
-    <p>A photo and a caption, made into a square cover.</p>
-    <label>Photo <input id="photo" type="file" accept="image/*"></label>
-    <label>Caption <input id="caption" type="text" maxlength="40" value="Sunset Heist"></label>
-    <button id="export" type="button">Export PNG 1080 x 1080</button>
-    <p id="status" role="status"></p>
+
+<header class="top">
+  <div class="brand">
+    <span class="mark" aria-hidden="true"></span>
+    <div>
+      <h1>Vice Ledger</h1>
+      <p>Multi-panel poster covers from your own photos. Everything stays on this machine.</p>
+    </div>
+  </div>
+  <div class="top-right">
+    <span id="size-readout">1080 × 1080</span>
+    <button id="export" class="primary" type="button">Export PNG</button>
+  </div>
+</header>
+
+<main class="shell">
+
+  <aside class="panelbar">
+
+    <section class="block">
+      <h2>1 · Photos</h2>
+      <label class="drop" for="photos">
+        <input id="photos" type="file" accept="image/*" multiple>
+        <b>Add photos</b>
+        <span>click, or drop them anywhere</span>
+      </label>
+      <div class="strip-head">
+        <span class="muted">Your photos</span>
+        <span id="photo-count" class="muted">no photos yet</span>
+      </div>
+      <div id="photo-strip" class="strip"></div>
+      <div class="row">
+        <button id="spread" type="button">Spread across panels</button>
+        <button id="fill-all" type="button">Use one in all</button>
+      </div>
+    </section>
+
+    <section class="block">
+      <h2>2 · Panel <span class="muted">click one in the preview</span></h2>
+      <div class="row panelnav">
+        <button id="prev-panel" type="button" aria-label="Previous panel">◀</button>
+        <span id="selected-label">Panel <b>1</b> of 3</span>
+        <button id="next-panel" type="button" aria-label="Next panel">▶</button>
+      </div>
+      <div class="field">
+        <label for="zoom"><span>Zoom</span><b id="zoom-val">1.00×</b></label>
+        <input id="zoom" type="range" min="1" max="3" step="0.01" value="1">
+      </div>
+      <p class="hint">Drag inside a panel to reframe. Arrow keys nudge; hold Shift to move faster.
+        Zoom is clamped so a panel never shows empty space.</p>
+      <div class="row">
+        <button id="reset-crop" type="button">Reset crops</button>
+      </div>
+    </section>
+
+    <section class="block">
+      <h2>3 · Words</h2>
+      <div class="field text">
+        <label for="caption"><span>Caption</span><b class="muted">title</b></label>
+        <input id="caption" type="text" maxlength="42" value="Pier Pressure" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field text">
+        <label for="strapline"><span>Strapline</span><b class="muted">under the title</b></label>
+        <input id="strapline" type="text" maxlength="64" value="The tide always comes back for its money" autocomplete="off" spellcheck="false">
+      </div>
+    </section>
+
+    <section class="block">
+      <h2>4 · Layout</h2>
+      <div id="layout-row" class="layout-row"></div>
+    </section>
+
+    <section class="block">
+      <h2>5 · Grade</h2>
+      <div id="grade-row" class="grade-row"></div>
+    </section>
+
+    <section class="block">
+      <h2>6 · Size</h2>
+      <div id="size-row" class="size-row"></div>
+    </section>
+
+  </aside>
+
+  <section class="stage">
+    <div id="preview-frame" class="preview-frame">
+      <canvas id="preview" width="1080" height="1080"></canvas>
+    </div>
+    <footer class="statusbar">
+      <span class="dot" aria-hidden="true"></span>
+      <span id="status">Ready.</span>
+    </footer>
   </section>
-  <canvas id="cover" width="1080" height="1080" aria-label="The cover"></canvas>
+
 </main>
-<script type="module" src="./src/main.js"></script>
+
+<div id="poster-stage" class="poster-stage"></div>
+
+<script type="module" src="src/main.js"></script>
 </body>
 </html>
