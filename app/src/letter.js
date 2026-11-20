@@ -18,10 +18,9 @@ const font = (stack, size) => stack.replace('{S}', String(size));
 /** How much the title is narrowed horizontally on top of an already condensed face. */
 const CONDENSE = 0.9;
 
-/** The numeral's one accent colour: a flat warm gold, no gradient. */
-const NUMERAL_INK = '#ffc35c';
-
-/** The words of a caption, in caps, with runs of spaces collapsed. */
+/**
+ * The words of a caption, in caps, with runs of spaces collapsed.
+ */
 export function titleWords(caption) {
   return String(caption ?? '')
     .toUpperCase()
@@ -127,14 +126,30 @@ function widestOf(ctx, lines, size, gapEm, wordEm, padEm) {
 /**
  * The title's tracking, in em: the white gap between two letters, between two words, and the
  * outline stroke's half-width (which the gap is measured outside of).
+ *
+ * The gap has to hold *outside* the fill's stroke, not outside the bare glyph: the fill pass
+ * strokes every letter with lineWidth = size*OUTLINE, which pushes its ink size*OUTLINE/2 out
+ * on each side. TRACK.pad is that reach (plus a little AA headroom) so neighbouring ink boxes
+ * are laid sidebearing-free, and TRACK.gap is then real white page. At a 250 px title that is
+ * ~24 px of white between letters: readable at 1280 wide, still tight enough to read as one
+ * wordmark. The word space stays about four letter gaps wide.
  */
-const TRACK = { gap: 0.062, word: 0.34, pad: 0.041 };
+const TRACK = { gap: 0.10, word: 0.40, pad: 0.045 };
 
 /** The outline stroke as a fraction of the title size, matched by TRACK.pad on each side. */
 const OUTLINE = 0.082;
 
-/** The numeral's outline, a little heavier than the title's so a small glyph keeps its weight. */
-const NUM_OUTLINE = 0.17;
+/** The numeral's proportion of the title size, and the gap that separates it from the title. */
+const NUM_RATIO = 0.78;
+const NUM_GAP = 0.2;
+
+/**
+ * The numeral's outline, sized so the numeral's ink grows *exactly* as much as the title's:
+ * the fill pass adds OUTLINE/2 to the title's letters, so a numeral drawn at NUM_RATIO of the
+ * size needs OUTLINE/NUM_RATIO to land on the same footing. That is also what makes the
+ * right-margin arithmetic exact — the visible ink edge is the measured box, not a guess.
+ */
+const NUM_OUTLINE = OUTLINE / NUM_RATIO;
 
 /**
  * Choose how to set the title: a single full-width line when the canvas is wide enough for that
@@ -143,8 +158,8 @@ const NUM_OUTLINE = 0.17;
  * the numeral's width and its gap already subtracted.
  */
 function fitLockup(ctx, lines, maxW, maxH, numeral) {
-  const numRatio = 0.78;
-  const numGap = 0.2;
+  const numRatio = NUM_RATIO;
+  const numGap = NUM_GAP;
   // The numeral's own outline pads it: measure its ink plus the stroke, so it cannot spill
   // past the right margin or close the gap to the title.
   const numWide = (size) => {
@@ -223,7 +238,6 @@ export function drawLockup(ctx, rect, grade, options) {
   const size = plan.size;
   const leading = plan.leading;
   const numSize = size * plan.numRatio;
-  const numW = plan.numW;
 
   // Centre the title and the strapline as one group inside the band.
   const groupH = plan.blockH + (strapline ? strapSize * 2.25 : 0);
@@ -231,17 +245,46 @@ export function drawLockup(ctx, rect, grade, options) {
   const firstBase = groupTop + size * 0.76;
   const lastBase = firstBase + (lines.length - 1) * leading * size;
 
-  const fillGrad = ctx.createLinearGradient(0, firstBase - size * 0.8, 0, lastBase + size * 0.06);
-  fillGrad.addColorStop(0, '#fffef8');
-  fillGrad.addColorStop(0.32, '#fff0cd');
-  fillGrad.addColorStop(0.66, '#ffd693');
-  fillGrad.addColorStop(1, '#f7b45e');
+  // A hard two-tone fill, not a smooth gradient: cream across the upper two thirds of the
+  // letterform, amber on the bottom third, with a hard edge between them. Flat paint reads as
+  // lettering; a smooth ramp reads as a gradient applied to a system font.
+  const fillGrad = ctx.createLinearGradient(0, firstBase - size * 0.74, 0, lastBase + size * 0.04);
+  fillGrad.addColorStop(0, '#fffdf2');
+  fillGrad.addColorStop(0.585, '#fff6dc');
+  fillGrad.addColorStop(0.6, '#ffd88f');
+  fillGrad.addColorStop(1, '#f4a94e');
 
   const outlineW = size * OUTLINE;
 
   // Each pass draws the same laid-out glyphs: the ink-kerned positions are computed once, so
   // the outline, the drop, the fill and the highlight cannot drift apart.
-  const paintLine = (laid, paint) => laid.glyphs.forEach(({ ch, pen }) => paint(ch, pen));
+  const paintLine = (laid, paint) => laid.glyphs.forEach(({ ch, pen }, gi) => paint(ch, pen, gi));
+
+  /**
+   * A hand-set wobble, one value per glyph: a two-degree swing and a hair of rise, cycling over
+   * eight letters. It is small enough to leave the measured gaps alone (under a pixel at any
+   * title size) and large enough that the wordmark stops sitting on one machined baseline --
+   * the difference between cut lettering and a row of system-font glyphs.
+   */
+  const wobble = (gi) => {
+    const phase = [0, 1, 0, -1, 1, 0, -1, 0][gi % 8];
+    return { turn: phase * 0.013, lift: ((gi % 3) - 1) * 0.012 * size };
+  };
+
+  /**
+   * One glyph, at its ink-kerned pen position, turned by its own wobble and condensed. Every
+   * layer calls this, so the ink shadow, the outline, the drop, the fill and the highlight are
+   * the same letterform painted five times, and can never drift apart.
+   */
+  const orbit = (ch, pen, gi, paint) => {
+    const w = wobble(gi);
+    ctx.save();
+    ctx.translate(pen, w.lift);
+    ctx.rotate(w.turn);
+    ctx.scale(CONDENSE, 1);
+    paint(ch);
+    ctx.restore();
+  };
 
   for (let li = 0; li < lines.length; li++) {
     const laid = plan.laid[li];
@@ -249,68 +292,101 @@ export function drawLockup(ctx, rect, grade, options) {
     const x0 = rect.x;
     ctx.font = font(DISPLAY, size);
 
-    // 1. The wide dark outline, round-joined, so the letterforms hold at any size.
+    // 1. The hard ink shadow, offset down-right and fully opaque. This is the layer that makes
+    //    the lettering read as ink on a card instead of type hanging in the air: no blur, one
+    //    offset, one colour.
     ctx.save();
-    ctx.translate(x0, y);
-    ctx.scale(CONDENSE, 1);
+    ctx.translate(x0 + size * 0.046, y + size * 0.052);
     ctx.lineJoin = 'round';
     ctx.lineCap = 'round';
-    ctx.strokeStyle = '#0b0413';
+    ctx.strokeStyle = '#07030c';
+    ctx.fillStyle = '#07030c';
     ctx.lineWidth = outlineW / CONDENSE;
-    paintLine(laid, (ch, x) => ctx.strokeText(ch, x, 0));
-    ctx.restore();
-
-    // 2. The mid-tone drop, offset down and right, showing its edge under the fill.
-    ctx.save();
-    ctx.translate(x0 + size * 0.026, y + size * 0.038);
-    ctx.scale(CONDENSE, 1);
-    ctx.fillStyle = grade.bandTint[2];
-    paintLine(laid, (ch, x) => ctx.fillText(ch, x, 0));
-    ctx.restore();
-
-    // 3. The fill: a warm cream-to-amber wash, stroked as well as filled so it meets the outline.
-    ctx.save();
-    ctx.translate(x0, y);
-    ctx.scale(CONDENSE, 1);
-    ctx.fillStyle = fillGrad;
-    ctx.lineJoin = 'round';
-    ctx.lineWidth = outlineW / CONDENSE;
-    ctx.strokeStyle = fillGrad;
-    paintLine(laid, (ch, x) => {
-      ctx.strokeText(ch, x, 0);
-      ctx.fillText(ch, x, 0);
+    paintLine(laid, (ch, x, gi) => {
+      orbit(ch, x, gi, (c) => {
+        ctx.strokeText(c, 0, 0);
+        ctx.fillText(c, 0, 0);
+      });
     });
     ctx.restore();
 
-    // 4. The thin highlight: the top slice of each letter, lit.
+    // 2. The wide dark outline at the fill's own position, round-joined, so the letterforms
+    //    hold as one mass at any size.
+    ctx.save();
+    ctx.translate(x0, y);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = grade.ink;
+    ctx.lineWidth = outlineW / CONDENSE;
+    paintLine(laid, (ch, x, gi) => {
+      orbit(ch, x, gi, (c) => ctx.strokeText(c, 0, 0));
+    });
+    ctx.restore();
+
+    // 3. The mid-tone drop, a shorter offset in the grade's hue: the lit edge of the bevel.
+    ctx.save();
+    ctx.translate(x0 + size * 0.018, y + size * 0.03);
+    ctx.fillStyle = grade.drop;
+    paintLine(laid, (ch, x, gi) => {
+      orbit(ch, x, gi, (c) => ctx.fillText(c, 0, 0));
+    });
+    ctx.restore();
+
+    // 4. The fill, stroked as well as filled so it meets the outline with no seam.
+    ctx.save();
+    ctx.translate(x0, y);
+    ctx.fillStyle = fillGrad;
+    ctx.strokeStyle = fillGrad;
+    ctx.lineJoin = 'round';
+    ctx.lineWidth = outlineW / CONDENSE;
+    paintLine(laid, (ch, x, gi) => {
+      orbit(ch, x, gi, (c) => {
+        ctx.strokeText(c, 0, 0);
+        ctx.fillText(c, 0, 0);
+      });
+    });
+    ctx.restore();
+
+    // 5. The highlight: a thin lit slice off the top of each letter, clipped to the cap band.
     ctx.save();
     ctx.beginPath();
-    ctx.rect(x0 - size * 0.1, y - size * 0.9, rect.w, size * 0.26);
+    ctx.rect(x0 - size * 0.1, y - size * 0.92, rect.w, size * 0.2);
     ctx.clip();
     ctx.translate(x0, y);
-    ctx.scale(CONDENSE, 1);
-    ctx.globalAlpha = 0.8;
+    ctx.globalAlpha = 0.72;
     ctx.fillStyle = '#fffefb';
-    paintLine(laid, (ch, x) => ctx.fillText(ch, x, 0));
+    paintLine(laid, (ch, x, gi) => {
+      orbit(ch, x, gi, (c) => ctx.fillText(c, 0, 0));
+    });
     ctx.restore();
   }
 
-  // The numeral: one flat accent colour, no gradient, hung off the right margin on the last
-  // baseline with its own measured gap. A deliberate accent, not a second fill treatment.
+  // The numeral: one flat accent colour, no gradient, hung off the cover's right margin on the
+  // last baseline with its own measured gap. A deliberate accent, not a second fill treatment.
   ctx.font = font(DISPLAY, numSize);
   const numInk = ctx.measureText(numeral);
-  const numLeft = typeof numInk.actualBoundingBoxLeft === 'number' ? -numInk.actualBoundingBoxLeft : 0;
-  const numX = rect.x + rect.w - numW - numLeft;
-  const numBase = lastBase;
+  const numInkLeft = typeof numInk.actualBoundingBoxLeft === 'number' ? numInk.actualBoundingBoxLeft : 0;
+  const numInkRight = typeof numInk.actualBoundingBoxRight === 'number' ? numInk.actualBoundingBoxRight : numInk.width;
+  const numStroke = Math.max(2, numSize * NUM_OUTLINE);
+  // Place on the visible ink, stroke included: the right edge of the numeral's gold fill is the
+  // cover's margin — its dark outline overshoots by half a stroke and stays inside the panel
+  // edge — so the lockup and the price tag above it share one vertical.
+  const numRight = rect.x + rect.w;
+  const numX = numRight - numInkRight;
+  const numVisLeft = numX - numInkLeft - numStroke / 2;
+  // The numeral sits on the title's bottom edge: the fill's baseline plus the mid-tone drop's
+  // offset, because the drop is what the eye reads as the foot of the letterform. Both layers
+  // add the same half-stroke to their ink, so the two visible bottoms come out flush.
+  const numBase = lastBase + size * 0.038;
   if (numSize > 6) {
     ctx.save();
     ctx.translate(numX, numBase);
     ctx.font = font(DISPLAY, numSize);
     ctx.lineJoin = 'round';
     ctx.strokeStyle = '#0b0413';
-    ctx.lineWidth = Math.max(2, numSize * NUM_OUTLINE);
+    ctx.lineWidth = numStroke;
     ctx.strokeText(numeral, 0, 0);
-    ctx.fillStyle = NUMERAL_INK;
+    ctx.fillStyle = grade.accent;
     ctx.fillText(numeral, 0, 0);
     ctx.restore();
 
@@ -319,17 +395,17 @@ export function drawLockup(ctx, rect, grade, options) {
     ctx.strokeStyle = 'rgba(255,214,150,0.5)';
     ctx.lineWidth = Math.max(1, numSize * 0.03);
     ctx.beginPath();
-    ctx.moveTo(numX, numBase - numSize * 0.99);
-    ctx.lineTo(numX + numW, numBase - numSize * 0.99);
+    ctx.moveTo(numVisLeft, numBase - numSize * 0.99);
+    ctx.lineTo(numRight, numBase - numSize * 0.99);
     ctx.stroke();
-    drawTracked(ctx, 'SERIES', numX, numBase + numSize * 0.3, Math.max(6, numSize * 0.17), 0.3, 'rgba(255,222,178,0.72)', 'left', MONO);
+    drawTracked(ctx, 'SERIES', numVisLeft, numBase + numSize * 0.3, Math.max(6, numSize * 0.17), 0.3, 'rgba(255,222,178,0.72)', 'left', MONO);
     ctx.restore();
   }
 
   // The strapline, flush left under the title's baseline block, wide-tracked. It gives way to
   // the numeral's column rather than running underneath it.
   if (strapline) {
-    const limit = numX - rect.x - size * 0.18;
+    const limit = numVisLeft - rect.x - size * 0.3;
     let sy2 = strapSize;
     for (let guard = 0; guard < 10; guard++) {
       ctx.font = font(UTILITY, sy2);
@@ -421,14 +497,30 @@ function drawPriceTag(ctx, box, unit) {
   ctx.lineWidth = Math.max(1, box.h * 0.055);
   ctx.stroke();
 
+  // Both lines are set to the box's own measure, so the tag always closes on its right edge
+  // and the numeral below it can be hung off that same vertical.
+  const x = box.x + box.w * 0.24;
+  const room = box.x + box.w - box.h * 0.1 - x;
+  const fitted = (stack, text, size) => {
+    let s = size;
+    for (let guard = 0; guard < 12; guard++) {
+      ctx.font = font(stack, s);
+      if (ctx.measureText(text).width <= room) break;
+      s *= 0.9;
+    }
+    return s;
+  };
+
   ctx.textAlign = 'left';
   ctx.textBaseline = 'middle';
+  const priceSize = fitted(DISPLAY, '$59.99', box.h * 0.56);
   ctx.fillStyle = '#ffe9c4';
-  ctx.font = font(DISPLAY, box.h * 0.56);
-  ctx.fillText('$59.99', box.x + box.w * 0.24, box.y + box.h * 0.44);
-  ctx.font = font(MONO, box.h * 0.2);
+  ctx.font = font(DISPLAY, priceSize);
+  ctx.fillText('$59.99', x, box.y + box.h * 0.44);
+  const noteSize = fitted(MONO, 'NO REFUNDS', box.h * 0.2);
+  ctx.font = font(MONO, noteSize);
   ctx.fillStyle = '#c9a97f';
-  ctx.fillText('NO REFUNDS', box.x + box.w * 0.24, box.y + box.h * 0.8);
+  ctx.fillText('NO REFUNDS', x, box.y + box.h * 0.8);
   ctx.restore();
 }
 
